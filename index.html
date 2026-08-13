@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Kartička — věrnostní QR podle polohy</title>
+<meta name="description" content="Otevři appku u pokladny a automaticky se ukáže věrnostní QR kód pro obchod, ve kterém právě jsi.">
+<meta name="theme-color" content="#14181F">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Kartička">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Kartička</span>
+    </div>
+    <button id="btnAdd" class="btn-icon" aria-label="Přidat QR kód" title="Přidat QR kód">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+  </header>
+
+  <!-- Status line: where the app thinks you are -->
+  <div id="statusLine" class="status-line">
+    <span id="statusDot" class="status-dot"></span>
+    <span id="statusText">Klepni na tlačítko a najdi svou kartičku</span>
+    <button id="btnLocate" class="btn-locate" aria-label="Zjistit polohu">📍 Najít</button>
+  </div>
+
+  <!-- Main stage -->
+  <main id="stage" class="stage">
+
+    <!-- state: no cards saved yet -->
+    <section id="emptyState" class="panel hidden">
+      <div class="panel-icon">＋</div>
+      <h1>Zatím žádné kartičky</h1>
+      <p>Přidej první věrnostní QR kód tlačítkem <strong>+</strong> nahoře. Appka ho pak sama nabídne, až budeš příště v tom obchodě.</p>
+      <button class="btn-primary" id="btnAddFromEmpty">Přidat první QR kód</button>
+    </section>
+
+    <!-- state: single match found -->
+    <section id="matchState" class="panel hidden">
+      <div class="match-label">Jsi tady, tak ať to nehledáš</div>
+      <h1 id="matchName" class="match-name">—</h1>
+      <div class="card-wrap">
+        <img id="matchImg" class="qr-img" alt="Věrnostní QR kód">
+      </div>
+      <button class="btn-ghost" id="btnAllFromMatch">Zobrazit všechny kartičky</button>
+    </section>
+
+    <!-- state: multiple candidates nearby -->
+    <section id="choiceState" class="panel hidden">
+      <div class="match-label">Poblíž je víc míst — vyber</div>
+      <div id="choiceGrid" class="choice-grid"></div>
+      <button class="btn-ghost" id="btnAllFromChoice">Zobrazit všechny kartičky</button>
+    </section>
+
+    <!-- state: nothing matched nearby -> browse list -->
+    <section id="listState" class="panel hidden">
+      <div class="match-label" id="listLabel">Nic poblíž nesedí — vyber ručně</div>
+      <div id="cardList" class="card-list"></div>
+    </section>
+
+    <!-- state: showing a single card full-screen (from list tap) -->
+    <section id="viewState" class="panel hidden">
+      <button class="back-link" id="btnBackFromView">← Zpět na seznam</button>
+      <h1 id="viewName" class="match-name">—</h1>
+      <div class="card-wrap">
+        <img id="viewImg" class="qr-img" alt="Věrnostní QR kód">
+      </div>
+      <button class="btn-danger-ghost" id="btnDeleteFromView">Smazat tuto kartičku</button>
+    </section>
+
+  </main>
+
+  <!-- Install prompts -->
+  <div id="installBanner" class="install-banner hidden">
+    <div class="install-text">
+      <strong id="installTitle">Přidat na plochu</strong>
+      <span id="installSub">Ať máš kartičky vždy jedním klepnutím po ruce.</span>
+    </div>
+    <div class="install-actions">
+      <button id="btnInstall" class="btn-primary btn-small">Nainstalovat</button>
+      <button id="btnInstallDismiss" class="btn-icon" aria-label="Zavřít">✕</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- Add-card modal -->
+<div id="addModal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Nová kartička</h2>
+      <button id="btnCloseModal" class="btn-icon" aria-label="Zavřít">✕</button>
+    </div>
+
+    <label class="field-label" for="storeName">Název obchodu</label>
+    <input id="storeName" class="text-input" type="text" placeholder="např. Albert, Kaufland, OMV…" autocomplete="off">
+    <p class="hint">Zkus přesně to jméno, jak ho appka najde na mapě (Albert, Lidl, Billa, OMV, Orlen…). Pomůže to automatickému rozpoznání.</p>
+
+    <label class="field-label" for="qrFile">Fotka / screenshot QR kódu</label>
+    <div id="dropZone" class="drop-zone">
+      <img id="previewImg" class="preview-img hidden" alt="Náhled QR kódu">
+      <div id="dropZoneEmpty" class="drop-zone-empty">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM20 14v3M14 20h3M20 20v.01"/></svg>
+        <span>Klepni a vyber fotku QR kódu</span>
+      </div>
+    </div>
+    <input id="qrFile" type="file" accept="image/*" class="visually-hidden">
+
+    <button id="btnSaveCard" class="btn-primary btn-full" disabled>Uložit kartičku</button>
+  </div>
+</div>
+
+<!-- iOS "add to home screen" instructions -->
+<div id="iosModal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Přidat na plochu</h2>
+      <button id="btnCloseIos" class="btn-icon" aria-label="Zavřít">✕</button>
+    </div>
+    <ol class="ios-steps">
+      <li><span class="ios-icon">􀈂</span> Klepni na tlačítko <strong>Sdílet</strong> dole ve Safari.</li>
+      <li>Vyber <strong>Přidat na plochu</strong>.</li>
+      <li>Potvrď <strong>Přidat</strong> — appka pak poběží přes celou obrazovku, bez adresního řádku.</li>
+    </ol>
+    <button id="btnCloseIos2" class="btn-primary btn-full">Rozumím</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
