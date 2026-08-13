@@ -1,0 +1,31 @@
+{
+  "name": "Kartička — věrnostní QR podle polohy",
+  "short_name": "Kartička",
+  "description": "Otevři appku u pokladny a automaticky se ukáže věrnostní QR kód pro obchod, ve kterém právě jsi.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#14181F",
+  "theme_color": "#14181F",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
