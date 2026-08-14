@@ -186,7 +186,8 @@ button{ font-family:inherit; }
 .match-name{
   font-family:var(--font-display);
   font-weight:700;
-  font-size:28px;
+  font-size:34px;
+  line-height:1.15;
   margin:0 0 22px;
   color:var(--white);
 }
@@ -212,6 +213,7 @@ button{ font-family:inherit; }
   object-fit:contain;
   border-radius:6px;
 }
+.qr-img.tappable{ cursor:pointer; }
 
 .btn-ghost{
   background:none; border:none;

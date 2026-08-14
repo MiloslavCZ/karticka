@@ -182,6 +182,8 @@ let lastCheckedPos = null;
 let lockedMatchIds = [];   // ids of the cards currently locked in as "the match"
 let lockedAt = 0;
 let userBrowsedAway = false; // true once the user manually opens the full list
+let manualViewOpen = false;  // true while a manually-picked card is on screen —
+                              // automatic location rechecks must not steal focus
 
 /* =========================================================
    PANEL SWITCHING
@@ -233,9 +235,16 @@ function openCardView(id) {
   const card = allCards.find((c) => c.id === id);
   if (!card) return;
   currentViewCardId = id;
+  manualViewOpen = true; // keep this card on screen until the user explicitly leaves
   els.viewName.textContent = card.name;
   els.viewImg.src = card.image;
   showPanel("viewState");
+}
+
+function leaveManualView() {
+  manualViewOpen = false;
+  userBrowsedAway = true;
+  renderCardList(allCards, "Všechny kartičky");
 }
 
 /* =========================================================
@@ -273,6 +282,12 @@ function renderForMatches(matchedCards) {
 }
 
 async function evaluateLocation(lat, lon) {
+  if (manualViewOpen) {
+    // User is actively looking at a card they picked themselves — never
+    // switch it out from under them because of a background location update.
+    return;
+  }
+
   await refreshCards();
   if (allCards.length === 0) {
     renderForNoCards();
@@ -458,6 +473,7 @@ els.btnSaveCard.addEventListener("click", async () => {
 
 els.btnLocate.addEventListener("click", () => {
   userBrowsedAway = false;
+  manualViewOpen = false;
   startLocating();
 });
 
@@ -476,7 +492,9 @@ els.btnAllFromChoice.addEventListener("click", () => {
   userBrowsedAway = true;
   renderCardList(allCards, "Všechny kartičky");
 });
-els.btnBackFromView.addEventListener("click", () => {
+els.btnBackFromView.addEventListener("click", leaveManualView);
+els.viewImg.addEventListener("click", leaveManualView);
+els.matchImg.addEventListener("click", () => {
   userBrowsedAway = true;
   renderCardList(allCards, "Všechny kartičky");
 });
@@ -487,6 +505,8 @@ els.btnDeleteFromView.addEventListener("click", async () => {
   if (!card) return;
   if (!confirm('Smazat kartičku „' + card.name + '“?')) return;
   await dbDeleteCard(currentViewCardId);
+  manualViewOpen = false;
+  userBrowsedAway = true;
   await refreshCards();
   toast("Kartička smazána");
   if (allCards.length === 0) renderForNoCards();
