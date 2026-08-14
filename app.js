@@ -208,19 +208,216 @@ function toast(msg) {
 }
 
 /* =========================================================
+   CUSTOM CARD ORDER (persisted locally, independent of DB insertion order)
+   ========================================================= */
+const ORDER_KEY = "karticka-card-order";
+
+function loadCardOrder() {
+  try {
+    const raw = localStorage.getItem(ORDER_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+function saveCardOrder(ids) {
+  try {
+    localStorage.setItem(ORDER_KEY, JSON.stringify(ids));
+  } catch {}
+}
+function applyCardOrder(cards) {
+  const order = loadCardOrder();
+  if (!order.length) return cards;
+  const pos = new Map(order.map((id, i) => [id, i]));
+  return [...cards].sort((a, b) => {
+    const ia = pos.has(a.id) ? pos.get(a.id) : Infinity;
+    const ib = pos.has(b.id) ? pos.get(b.id) : Infinity;
+    if (ia !== ib) return ia - ib;
+    return a.createdAt - b.createdAt;
+  });
+}
+
+/* =========================================================
+   LONG-PRESS DRAG-TO-REORDER (Pointer Events — works for touch + mouse)
+   ========================================================= */
+const LONG_PRESS_MS = 380;
+const DRAG_CANCEL_THRESHOLD_PX = 10;
+
+let dragState = null;
+
+function captureRowRects() {
+  const map = new Map();
+  Array.from(els.cardList.children).forEach((rowEl) => {
+    map.set(rowEl.dataset.cardId, rowEl.getBoundingClientRect());
+  });
+  return map;
+}
+
+function animateDisplacedRows(prevRects) {
+  Array.from(els.cardList.children).forEach((rowEl) => {
+    if (dragState && rowEl === dragState.row) return;
+    const oldRect = prevRects.get(rowEl.dataset.cardId);
+    if (!oldRect) return;
+    const newRect = rowEl.getBoundingClientRect();
+    const delta = oldRect.top - newRect.top;
+    if (Math.abs(delta) > 0.5) {
+      rowEl.style.transition = "none";
+      rowEl.style.transform = `translateY(${delta}px)`;
+      requestAnimationFrame(() => {
+        rowEl.style.transition = "transform 160ms ease";
+        rowEl.style.transform = "";
+      });
+    }
+  });
+}
+
+function beginDrag(row, clientY) {
+  dragState = { row, pointerStartY: clientY };
+  row.classList.add("dragging");
+  row.style.transition = "none";
+  row.style.touchAction = "none";
+}
+
+function moveDrag(clientY) {
+  if (!dragState) return;
+  const { row } = dragState;
+  const dy = clientY - dragState.pointerStartY;
+  row.style.transform = `translateY(${dy}px)`;
+
+  const draggedRect = row.getBoundingClientRect();
+  const draggedMid = draggedRect.top + draggedRect.height / 2;
+  const rows = Array.from(els.cardList.children);
+  const idx = rows.indexOf(row);
+
+  let insertBeforeNode = null;
+
+  const prev = rows[idx - 1];
+  if (prev) {
+    const r = prev.getBoundingClientRect();
+    if (draggedMid < r.top + r.height / 2) insertBeforeNode = prev;
+  }
+  if (!insertBeforeNode) {
+    const next = rows[idx + 1];
+    if (next) {
+      const r = next.getBoundingClientRect();
+      if (draggedMid > r.top + r.height / 2) insertBeforeNode = next.nextSibling;
+    }
+  }
+
+  if (insertBeforeNode) {
+    const prevRects = captureRowRects();
+    const beforeTop = row.getBoundingClientRect().top;
+    els.cardList.insertBefore(row, insertBeforeNode);
+    row.style.transform = "none";
+    const afterTopNoTransform = row.getBoundingClientRect().top;
+    const neededDy = beforeTop - afterTopNoTransform;
+    dragState.pointerStartY = clientY - neededDy;
+    row.style.transform = `translateY(${neededDy}px)`;
+    animateDisplacedRows(prevRects);
+  }
+}
+
+function endDrag() {
+  if (!dragState) return;
+  const { row } = dragState;
+  row.classList.remove("dragging");
+  row.style.transform = "";
+  row.style.transition = "";
+  row.style.touchAction = "";
+  dragState = null;
+
+  const ids = Array.from(els.cardList.children)
+    .map((rowEl) => Number(rowEl.dataset.cardId))
+    .filter((n) => !Number.isNaN(n));
+  saveCardOrder(ids);
+}
+
+function attachRowDrag(row) {
+  let timer = null;
+  let startX = 0;
+  let startY = 0;
+  let longPressFired = false;
+  let suppressClick = false;
+
+  function clearTimer() {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+  function onMove(e) {
+    if (!longPressFired) {
+      if (
+        Math.abs(e.clientX - startX) > DRAG_CANCEL_THRESHOLD_PX ||
+        Math.abs(e.clientY - startY) > DRAG_CANCEL_THRESHOLD_PX
+      ) {
+        clearTimer();
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+      }
+      return;
+    }
+    e.preventDefault();
+    moveDrag(e.clientY);
+  }
+  function onUp() {
+    clearTimer();
+    document.removeEventListener("pointermove", onMove);
+    document.removeEventListener("pointerup", onUp);
+    if (longPressFired) {
+      endDrag();
+      suppressClick = true;
+      setTimeout(() => { suppressClick = false; }, 60);
+    }
+    longPressFired = false;
+  }
+
+  row.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    startX = e.clientX;
+    startY = e.clientY;
+    longPressFired = false;
+    document.addEventListener("pointermove", onMove, { passive: false });
+    document.addEventListener("pointerup", onUp);
+    timer = setTimeout(() => {
+      longPressFired = true;
+      beginDrag(row, e.clientY);
+      if (navigator.vibrate) navigator.vibrate(10);
+    }, LONG_PRESS_MS);
+  });
+
+  // Swallow the click that would otherwise fire right after a drag release.
+  row.addEventListener(
+    "click",
+    (e) => {
+      if (suppressClick) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    },
+    true
+  );
+}
+
+/* =========================================================
    RENDER: LIST OF ALL CARDS (browse mode / fallback)
    ========================================================= */
 function renderCardList(cards, label) {
   els.listLabel.textContent = label || "Vyber kartičku";
   els.cardList.innerHTML = "";
-  cards.forEach((card) => {
+  const ordered = applyCardOrder(cards);
+  ordered.forEach((card) => {
     const row = document.createElement("button");
     row.className = "card-row";
+    row.dataset.cardId = String(card.id);
     row.innerHTML = `
       <img class="card-row-thumb" src="${card.image}" alt="">
       <span class="card-row-name">${escapeHtml(card.name)}</span>
+      <span class="card-row-grip" aria-hidden="true">⠿</span>
     `;
     row.addEventListener("click", () => openCardView(card.id));
+    attachRowDrag(row);
     els.cardList.appendChild(row);
   });
   showPanel("listState");
