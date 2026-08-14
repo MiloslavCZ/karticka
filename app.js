@@ -287,35 +287,37 @@ function moveDrag(clientY) {
 
   const draggedRect = row.getBoundingClientRect();
   const draggedMid = draggedRect.top + draggedRect.height / 2;
+
+  // Find the correct slot for the dragged row by comparing against every
+  // other row's midpoint (not just the immediate neighbor) — this handles
+  // both directions correctly and even lets a fast drag skip several rows
+  // at once instead of only being able to swap one step at a time.
   const rows = Array.from(els.cardList.children);
-  const idx = rows.indexOf(row);
-
   let insertBeforeNode = null;
-
-  const prev = rows[idx - 1];
-  if (prev) {
-    const r = prev.getBoundingClientRect();
-    if (draggedMid < r.top + r.height / 2) insertBeforeNode = prev;
-  }
-  if (!insertBeforeNode) {
-    const next = rows[idx + 1];
-    if (next) {
-      const r = next.getBoundingClientRect();
-      if (draggedMid > r.top + r.height / 2) insertBeforeNode = next.nextSibling;
+  for (const sib of rows) {
+    if (sib === row) continue;
+    const r = sib.getBoundingClientRect();
+    const sibMid = r.top + r.height / 2;
+    if (draggedMid < sibMid) {
+      insertBeforeNode = sib;
+      break;
     }
   }
 
-  if (insertBeforeNode) {
-    const prevRects = captureRowRects();
-    const beforeTop = row.getBoundingClientRect().top;
-    els.cardList.insertBefore(row, insertBeforeNode);
-    row.style.transform = "none";
-    const afterTopNoTransform = row.getBoundingClientRect().top;
-    const neededDy = beforeTop - afterTopNoTransform;
-    dragState.pointerStartY = clientY - neededDy;
-    row.style.transform = `translateY(${neededDy}px)`;
-    animateDisplacedRows(prevRects);
-  }
+  const currentSlot = row.nextElementSibling; // null if row is currently last
+  const alreadyThere =
+    insertBeforeNode === currentSlot || (insertBeforeNode === null && currentSlot === null);
+  if (alreadyThere) return;
+
+  const prevRects = captureRowRects();
+  const beforeTop = row.getBoundingClientRect().top;
+  els.cardList.insertBefore(row, insertBeforeNode); // insertBeforeNode === null appends at the end
+  row.style.transform = "none";
+  const afterTopNoTransform = row.getBoundingClientRect().top;
+  const neededDy = beforeTop - afterTopNoTransform;
+  dragState.pointerStartY = clientY - neededDy;
+  row.style.transform = `translateY(${neededDy}px)`;
+  animateDisplacedRows(prevRects);
 }
 
 function endDrag() {
@@ -412,7 +414,7 @@ function renderCardList(cards, label) {
     row.className = "card-row";
     row.dataset.cardId = String(card.id);
     row.innerHTML = `
-      <img class="card-row-thumb" src="${card.image}" alt="">
+      <img class="card-row-thumb" src="${card.image}" alt="" draggable="false">
       <span class="card-row-name">${escapeHtml(card.name)}</span>
       <span class="card-row-grip" aria-hidden="true">⠿</span>
     `;
