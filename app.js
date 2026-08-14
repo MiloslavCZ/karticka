@@ -4,8 +4,9 @@
    CONFIG
    ========================================================= */
 const MATCH_RADIUS_M = 75;          // how far around the user we look for shops
-const RECHECK_MIN_DISTANCE_M = 12;  // re-query Overpass after moving this far…
-const RECHECK_MIN_INTERVAL_MS = 6000; // …or after this much time (whichever first)
+const RECHECK_MIN_DISTANCE_M = 8;   // re-query Overpass after moving this far…
+const RECHECK_MIN_INTERVAL_MS = 4000; // …or after this much time (whichever first) —
+                                     // only applies while no card is manually open
 const MATCH_LOCK_MS = 90000;        // once a match is found, keep showing it for this
                                      // long even if a single recheck comes up empty
                                      // (avoids flicker from a momentary GPS/API blip)
@@ -245,6 +246,9 @@ function leaveManualView() {
   manualViewOpen = false;
   userBrowsedAway = true;
   renderCardList(allCards, "Všechny kartičky");
+  // Card is closed — immediately check location again instead of waiting for
+  // the next background GPS tick, so a fresh match can appear right away.
+  startLocating();
 }
 
 /* =========================================================
@@ -358,6 +362,11 @@ function distanceMeters(a, b) {
 }
 
 function maybeRecheck(lat, lon) {
+  if (manualViewOpen) {
+    // A card is open on screen — don't burn Overpass calls checking location
+    // in the background. We'll do a fresh check the moment the card is closed.
+    return;
+  }
   const now = Date.now();
   const pos = { lat, lon };
   const moved = lastCheckedPos ? distanceMeters(lastCheckedPos, pos) : Infinity;
