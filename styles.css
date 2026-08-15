@@ -238,6 +238,24 @@ button{ font-family:inherit; }
   cursor:pointer;
   padding:6px 0 18px;
 }
+.spot-hint{
+  font-size:12.5px;
+  color:var(--gray);
+  margin:10px 0 4px;
+  max-width:300px;
+}
+.view-footer{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  margin-top:6px;
+}
+.view-footer .btn-ghost,
+.view-footer .btn-danger-ghost{
+  font-size:12.5px;
+  padding:8px 12px;
+  margin-top:0;
+}
 .btn-danger-ghost{
   background:none;
   border:1px solid rgba(227,134,134,0.4);

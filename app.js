@@ -3,8 +3,11 @@
 /* =========================================================
    CONFIG
    ========================================================= */
-const MATCH_RADIUS_M = 75;          // how far around the user we look for shops
-const RECHECK_MIN_DISTANCE_M = 8;   // re-query Overpass after moving this far…
+const MATCH_RADIUS_M = 100;         // OSM (Overpass) fallback search radius
+const LOCAL_MATCH_RADIUS_M = 55;    // radius for matching against a card's own
+                                     // remembered GPS spots — tighter, since it's
+                                     // an exact fix rather than a named area
+const RECHECK_MIN_DISTANCE_M = 8;   // re-check location after moving this far…
 const RECHECK_MIN_INTERVAL_MS = 4000; // …or after this much time (whichever first) —
                                      // only applies while no card is manually open
 const MATCH_LOCK_MS = 90000;        // once a match is found, keep showing it for this
@@ -37,7 +40,12 @@ async function dbAddCard(name, imageDataUrl) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, "readwrite");
-    tx.objectStore(DB_STORE).add({ name, image: imageDataUrl, createdAt: Date.now() });
+    tx.objectStore(DB_STORE).add({
+      name,
+      image: imageDataUrl,
+      createdAt: Date.now(),
+      locations: [] // remembered GPS spots where this card was manually confirmed
+    });
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -48,7 +56,7 @@ async function dbGetAllCards() {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, "readonly");
     const req = tx.objectStore(DB_STORE).getAll();
-    req.onsuccess = () => resolve(req.result || []);
+    req.onsuccess = () => resolve((req.result || []).map((c) => ({ ...c, locations: c.locations || [] })));
     req.onerror = () => reject(req.error);
   });
 }
@@ -58,6 +66,45 @@ async function dbDeleteCard(id) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, "readwrite");
     tx.objectStore(DB_STORE).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+const MAX_SAVED_SPOTS_PER_CARD = 6;
+
+async function dbAddLocationToCard(id, lat, lon) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    const store = tx.objectStore(DB_STORE);
+    const getReq = store.get(id);
+    getReq.onsuccess = () => {
+      const card = getReq.result;
+      if (!card) { resolve(); return; }
+      const locations = card.locations || [];
+      locations.push({ lat, lon, savedAt: Date.now() });
+      // keep only the most recent few fixes so old/stale data doesn't pile up
+      card.locations = locations.slice(-MAX_SAVED_SPOTS_PER_CARD);
+      store.put(card);
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbClearLocationsForCard(id) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    const store = tx.objectStore(DB_STORE);
+    const getReq = store.get(id);
+    getReq.onsuccess = () => {
+      const card = getReq.result;
+      if (!card) { resolve(); return; }
+      card.locations = [];
+      store.put(card);
+    };
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -146,6 +193,9 @@ const els = {
   listLabel: el("listLabel"),
   viewName: el("viewName"),
   viewImg: el("viewImg"),
+  btnSaveSpot: el("btnSaveSpot"),
+  spotHint: el("spotHint"),
+  btnClearSpots: el("btnClearSpots"),
   btnLocate: el("btnLocate"),
   btnAdd: el("btnAdd"),
   btnAddFromEmpty: el("btnAddFromEmpty"),
@@ -431,6 +481,16 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+function refreshSpotHint(card) {
+  const n = (card.locations || []).length;
+  if (n === 0) {
+    els.spotHint.textContent = "Zatím appka nezná žádné tvoje místo pro tuhle kartičku.";
+  } else {
+    els.spotHint.textContent =
+      "Uloženo míst: " + n + " — příště tě appka pozná i bez map, jakmile budeš blízko.";
+  }
+}
+
 function openCardView(id) {
   const card = allCards.find((c) => c.id === id);
   if (!card) return;
@@ -438,6 +498,7 @@ function openCardView(id) {
   manualViewOpen = true; // keep this card on screen until the user explicitly leaves
   els.viewName.textContent = card.name;
   els.viewImg.src = card.image;
+  refreshSpotHint(card);
   showPanel("viewState");
 }
 
@@ -498,6 +559,24 @@ async function evaluateLocation(lat, lon) {
     return;
   }
 
+  // --- FAST PATH: compare against each card's own remembered GPS spots. ---
+  // This needs no network call, so it's instant, and it works even for shops
+  // OpenStreetMap doesn't know about at all (e.g. individual stores inside a
+  // shopping mall) — as long as you've confirmed you were there once before.
+  const here = { lat, lon };
+  const localMatches = allCards.filter((card) =>
+    (card.locations || []).some((loc) => distanceMeters(here, loc) <= LOCAL_MATCH_RADIUS_M)
+  );
+  if (localMatches.length > 0) {
+    lockedMatchIds = localMatches.map((c) => c.id);
+    lockedAt = Date.now();
+    userBrowsedAway = false;
+    setStatus("Poblíž (podle uložené polohy): " + localMatches.map((c) => c.name).join(", "), "live");
+    renderForMatches(localMatches);
+    return;
+  }
+
+  // --- SLOWER FALLBACK: ask OpenStreetMap what's nearby by name. ---
   setStatus("Zjišťuji, kde právě jsi…", "warn");
 
   let nearby = [];
@@ -527,6 +606,9 @@ async function evaluateLocation(lat, lon) {
     userBrowsedAway = false;
     setStatus("Poblíž: " + matched.map((c) => c.name).join(", "), "live");
     renderForMatches(matched);
+    // Remember this spot for next time, so future visits skip the slow OSM
+    // lookup entirely and use the instant local match instead.
+    matched.forEach((c) => dbAddLocationToCard(c.id, lat, lon));
     return;
   }
 
@@ -577,6 +659,7 @@ function maybeRecheck(lat, lon) {
 }
 
 let watchStarted = false;
+let lastKnownPosition = null; // {lat, lon, accuracy} — used by the "save this spot" button
 
 function startLocating() {
   if (!("geolocation" in navigator)) {
@@ -597,6 +680,7 @@ function startLocating() {
     (p) => {
       lastCheckedAt = Date.now();
       lastCheckedPos = { lat: p.coords.latitude, lon: p.coords.longitude };
+      lastKnownPosition = { lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy };
       evaluateLocation(p.coords.latitude, p.coords.longitude);
     },
     (err) => {
@@ -619,7 +703,10 @@ function startLocating() {
   if (!watchStarted) {
     watchStarted = true;
     navigator.geolocation.watchPosition(
-      (p) => maybeRecheck(p.coords.latitude, p.coords.longitude),
+      (p) => {
+        lastKnownPosition = { lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy };
+        maybeRecheck(p.coords.latitude, p.coords.longitude);
+      },
       () => {},
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 15000 }
     );
@@ -705,6 +792,34 @@ els.viewImg.addEventListener("click", leaveManualView);
 els.matchImg.addEventListener("click", () => {
   userBrowsedAway = true;
   renderCardList(allCards, "Všechny kartičky");
+});
+
+els.btnSaveSpot.addEventListener("click", async () => {
+  if (currentViewCardId == null) return;
+  if (!lastKnownPosition) {
+    toast("Poloha zatím není známá — zkus to za chvíli");
+    return;
+  }
+  await dbAddLocationToCard(currentViewCardId, lastKnownPosition.lat, lastKnownPosition.lon);
+  await refreshCards();
+  const card = allCards.find((c) => c.id === currentViewCardId);
+  if (card) refreshSpotHint(card);
+  toast("Poloha uložena ✓");
+});
+
+els.btnClearSpots.addEventListener("click", async () => {
+  if (currentViewCardId == null) return;
+  const card = allCards.find((c) => c.id === currentViewCardId);
+  if (!card || !(card.locations || []).length) {
+    toast("Žádná uložená místa ke smazání");
+    return;
+  }
+  if (!confirm("Smazat všechna uložená místa pro „" + card.name + "“?")) return;
+  await dbClearLocationsForCard(currentViewCardId);
+  await refreshCards();
+  const updated = allCards.find((c) => c.id === currentViewCardId);
+  if (updated) refreshSpotHint(updated);
+  toast("Uložená místa smazána");
 });
 
 els.btnDeleteFromView.addEventListener("click", async () => {
