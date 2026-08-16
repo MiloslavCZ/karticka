@@ -1,11 +1,12 @@
 // Bump this version string every time you change index.html / app.js / styles.css
 // so the browser knows to fetch fresh files instead of serving old cached ones.
-const CACHE_NAME = "karticka-v8";
+const CACHE_NAME = "karticka-v9";
 const CORE_ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./brands.js",
   "./manifest.json",
   "./icons/icon-192.png",
   "./icons/icon-512.png",

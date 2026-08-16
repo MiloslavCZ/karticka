@@ -3,32 +3,59 @@
 /* =========================================================
    CONFIG
    ========================================================= */
-const MATCH_RADIUS_M = 100;         // OSM (Overpass) fallback search radius
-const LOCAL_MATCH_RADIUS_M = 55;    // radius for matching against a card's own
-                                     // remembered GPS spots — tighter, since it's
-                                     // an exact fix rather than a named area
-const RECHECK_MIN_DISTANCE_M = 8;   // re-check location after moving this far…
-const RECHECK_MIN_INTERVAL_MS = 4000; // …or after this much time (whichever first) —
-                                     // only applies while no card is manually open
-const MATCH_LOCK_MS = 90000;        // once a match is found, keep showing it for this
-                                     // long even if a single recheck comes up empty
-                                     // (avoids flicker from a momentary GPS/API blip)
 const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
+const CZ_BBOX = "48.5,12.0,51.1,18.9"; // rough bounding box for Czech Republic,
+                                        // used only when downloading a brand's
+                                        // branches (once in a while, not per-check)
+
+const MATCH_RADIUS_M = 100;          // OSM live-lookup fallback search radius
+const AUTO_MATCH_RADIUS_M = 100;     // radius for matching against the local
+                                      // brand-POI database
+const ACCURACY_MARGIN_CAP_M = 150;   // how much extra radius bad GPS accuracy
+                                      // is allowed to buy, at most
+const LOCAL_MATCH_RADIUS_M = 55;     // radius for matching against a card's own
+                                      // remembered exact GPS spots — tightest,
+                                      // since it's an exact fix, not an area
+
+const RECHECK_MIN_DISTANCE_M = 8;    // re-check location after moving this far…
+const RECHECK_MIN_INTERVAL_MS = 4000; // …or after this much time (whichever first) —
+                                       // only applies while no card is manually open
+const MATCH_LOCK_MS = 90000;         // once a match is found, keep showing it for this
+                                      // long even if a single recheck comes up empty
+                                      // (avoids flicker from a momentary GPS/API blip)
+
+const SYNC_STALE_MS = 1000 * 60 * 60 * 24 * 30; // re-sync a brand's branches
+                                                 // after this long (30 days)
 const INSTALL_DISMISS_DAYS = 7;
+const MAX_SUGGESTIONS = 6;
 
 /* =========================================================
-   TINY INDEXEDDB WRAPPER (cards store: {id, name, image, createdAt})
+   TINY INDEXEDDB WRAPPER
+   Stores:
+     cards    { id, brandId, name, image, createdAt, locations:[{lat,lon,savedAt}] }
+     pois     { id, brandId, lat, lon }                     — local branch database
+     syncMeta { brandId, syncedAt, poiCount }                — per-brand sync bookkeeping
    ========================================================= */
 const DB_NAME = "karticka-db";
+const DB_VERSION = 2;
 const DB_STORE = "cards";
+const POI_STORE = "pois";
+const SYNC_STORE = "syncMeta";
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(DB_STORE)) {
         db.createObjectStore(DB_STORE, { keyPath: "id", autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains(POI_STORE)) {
+        const poiStore = db.createObjectStore(POI_STORE, { keyPath: "id", autoIncrement: true });
+        poiStore.createIndex("brandId", "brandId", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(SYNC_STORE)) {
+        db.createObjectStore(SYNC_STORE, { keyPath: "brandId" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -36,15 +63,17 @@ function openDb() {
   });
 }
 
-async function dbAddCard(name, imageDataUrl) {
+/* ---- cards ---- */
+async function dbAddCard(name, imageDataUrl, brandId) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, "readwrite");
     tx.objectStore(DB_STORE).add({
       name,
+      brandId: brandId != null ? brandId : null,
       image: imageDataUrl,
       createdAt: Date.now(),
-      locations: [] // remembered GPS spots where this card was manually confirmed
+      locations: [] // remembered exact GPS spots where this card was confirmed
     });
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
@@ -56,7 +85,14 @@ async function dbGetAllCards() {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, "readonly");
     const req = tx.objectStore(DB_STORE).getAll();
-    req.onsuccess = () => resolve((req.result || []).map((c) => ({ ...c, locations: c.locations || [] })));
+    req.onsuccess = () =>
+      resolve(
+        (req.result || []).map((c) => ({
+          ...c,
+          locations: c.locations || [],
+          brandId: c.brandId != null ? c.brandId : null
+        }))
+      );
     req.onerror = () => reject(req.error);
   });
 }
@@ -66,6 +102,23 @@ async function dbDeleteCard(id) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, "readwrite");
     tx.objectStore(DB_STORE).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbSetCardBrand(id, brandId) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    const store = tx.objectStore(DB_STORE);
+    const getReq = store.get(id);
+    getReq.onsuccess = () => {
+      const card = getReq.result;
+      if (!card) { resolve(); return; }
+      card.brandId = brandId;
+      store.put(card);
+    };
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -84,7 +137,6 @@ async function dbAddLocationToCard(id, lat, lon) {
       if (!card) { resolve(); return; }
       const locations = card.locations || [];
       locations.push({ lat, lon, savedAt: Date.now() });
-      // keep only the most recent few fixes so old/stale data doesn't pile up
       card.locations = locations.slice(-MAX_SAVED_SPOTS_PER_CARD);
       store.put(card);
     };
@@ -110,8 +162,127 @@ async function dbClearLocationsForCard(id) {
   });
 }
 
+/* ---- local brand POI database ---- */
+async function dbReplacePoisForBrand(brandId, points) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(POI_STORE, "readwrite");
+    const store = tx.objectStore(POI_STORE);
+    const idx = store.index("brandId");
+    const cursorReq = idx.openCursor(IDBKeyRange.only(brandId));
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (cursor) {
+        cursor.delete();
+        cursor.continue();
+      } else {
+        points.forEach((p) => store.add({ brandId, lat: p.lat, lon: p.lon }));
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbGetPoisForBrand(brandId) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(POI_STORE, "readonly");
+    const idx = tx.objectStore(POI_STORE).index("brandId");
+    const req = idx.getAll(IDBKeyRange.only(brandId));
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/* ---- per-brand sync bookkeeping ---- */
+async function dbSetSyncMeta(brandId, meta) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SYNC_STORE, "readwrite");
+    tx.objectStore(SYNC_STORE).put({ brandId, ...meta });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbGetAllSyncMeta() {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SYNC_STORE, "readonly");
+    const req = tx.objectStore(SYNC_STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+let syncMetaCache = new Map(); // brandId -> {brandId, syncedAt, poiCount}
+async function loadSyncMetaCache() {
+  const all = await dbGetAllSyncMeta();
+  syncMetaCache = new Map(all.map((m) => [m.brandId, m]));
+}
+function brandHasPois(brandId) {
+  const meta = syncMetaCache.get(brandId);
+  return !!(meta && meta.poiCount > 0);
+}
+
 /* =========================================================
-   NAME NORMALIZATION + FUZZY MATCH
+   BRAND SYNC — download a brand's branches from OpenStreetMap
+   once in a while, store just {brandId, lat, lon} locally.
+   ========================================================= */
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function syncBrandPois(brandId) {
+  const brand = BRANDS.find((b) => b.id === brandId);
+  if (!brand) return 0;
+  const token = escapeRegex(brand.q || brand.name);
+  const query = `
+    [out:json][timeout:50];
+    (
+      node["name"~"^${token}",i](${CZ_BBOX});
+      way["name"~"^${token}",i](${CZ_BBOX});
+      node["brand"~"^${token}",i](${CZ_BBOX});
+      way["brand"~"^${token}",i](${CZ_BBOX});
+    );
+    out center;
+  `;
+  const res = await fetch(OVERPASS_ENDPOINT, {
+    method: "POST",
+    body: "data=" + encodeURIComponent(query)
+  });
+  if (!res.ok) throw new Error("overpass_http_" + res.status);
+  const json = await res.json();
+
+  const points = [];
+  for (const elmt of json.elements || []) {
+    const lat = elmt.lat != null ? elmt.lat : elmt.center && elmt.center.lat;
+    const lon = elmt.lon != null ? elmt.lon : elmt.center && elmt.center.lon;
+    if (lat == null || lon == null) continue;
+    points.push({ lat, lon });
+  }
+
+  await dbReplacePoisForBrand(brandId, points);
+  await dbSetSyncMeta(brandId, { syncedAt: Date.now(), poiCount: points.length });
+  syncMetaCache.set(brandId, { brandId, syncedAt: Date.now(), poiCount: points.length });
+  return points.length;
+}
+
+async function maybeSyncBrand(brandId) {
+  const meta = syncMetaCache.get(brandId);
+  if (meta && Date.now() - meta.syncedAt < SYNC_STALE_MS) return;
+  try {
+    toast("Stahuji pobočky…");
+    const n = await syncBrandPois(brandId);
+    toast("Pobočky staženy (" + n + ")");
+  } catch (e) {
+    // Silent failure is fine — the live OSM fallback still covers this brand.
+  }
+}
+
+/* =========================================================
+   NAME NORMALIZATION + FUZZY MATCH (used by the legacy/fallback path)
    ========================================================= */
 function normalizeName(str) {
   return (str || "")
@@ -122,7 +293,6 @@ function normalizeName(str) {
     .trim();
 }
 
-// true if the card's saved name and a POI's name plausibly refer to the same place
 function namesMatch(cardName, poiName) {
   const a = normalizeName(cardName);
   const b = normalizeName(poiName);
@@ -134,7 +304,7 @@ function namesMatch(cardName, poiName) {
 }
 
 /* =========================================================
-   OVERPASS: FIND NEARBY NAMED PLACES
+   OVERPASS: live "what's near me right now" lookup (fallback only)
    ========================================================= */
 async function fetchNearbyPlaces(lat, lon) {
   const q = `
@@ -151,7 +321,6 @@ async function fetchNearbyPlaces(lat, lon) {
     );
     out center tags;
   `;
-
   const res = await fetch(OVERPASS_ENDPOINT, {
     method: "POST",
     body: "data=" + encodeURIComponent(q)
@@ -161,8 +330,8 @@ async function fetchNearbyPlaces(lat, lon) {
 
   const places = [];
   const seenNames = new Set();
-  for (const el of json.elements || []) {
-    const tags = el.tags || {};
+  for (const elmt of json.elements || []) {
+    const tags = elmt.tags || {};
     const name = tags.name || tags.brand;
     if (!name) continue;
     const key = normalizeName(name);
@@ -196,6 +365,14 @@ const els = {
   btnSaveSpot: el("btnSaveSpot"),
   spotHint: el("spotHint"),
   btnClearSpots: el("btnClearSpots"),
+  brandSyncRow: el("brandSyncRow"),
+  brandSyncHint: el("brandSyncHint"),
+  btnSyncBrand: el("btnSyncBrand"),
+  assignBrandRow: el("assignBrandRow"),
+  btnShowAssignBrand: el("btnShowAssignBrand"),
+  assignBrandWrap: el("assignBrandWrap"),
+  assignBrandInput: el("assignBrandInput"),
+  assignBrandSuggestions: el("assignBrandSuggestions"),
   btnLocate: el("btnLocate"),
   btnAdd: el("btnAdd"),
   btnAddFromEmpty: el("btnAddFromEmpty"),
@@ -206,6 +383,7 @@ const els = {
   addModal: el("addModal"),
   btnCloseModal: el("btnCloseModal"),
   storeName: el("storeName"),
+  brandSuggestions: el("brandSuggestions"),
   dropZone: el("dropZone"),
   dropZoneEmpty: el("dropZoneEmpty"),
   previewImg: el("previewImg"),
@@ -225,12 +403,13 @@ const els = {
 let allCards = [];
 let currentViewCardId = null;
 let pendingImageDataUrl = null;
+let selectedBrandId = null; // set by the add-card autocomplete
 let lastCheckedAt = 0;
 let lastCheckedPos = null;
 
 // "lock" state: once we find a match, keep it on screen for MATCH_LOCK_MS even
 // if a later recheck briefly comes back empty (flaky GPS / Overpass hiccup).
-let lockedMatchIds = [];   // ids of the cards currently locked in as "the match"
+let lockedMatchIds = [];
 let lockedAt = 0;
 let userBrowsedAway = false; // true once the user manually opens the full list
 let manualViewOpen = false;  // true while a manually-picked card is on screen —
@@ -255,6 +434,41 @@ function toast(msg) {
   els.toast.classList.remove("hidden");
   clearTimeout(toast._t);
   toast._t = setTimeout(() => els.toast.classList.add("hidden"), 2200);
+}
+
+/* =========================================================
+   BRAND AUTOCOMPLETE (shared between add-card modal and
+   "assign a brand to an old card" flow)
+   ========================================================= */
+function wireBrandAutocomplete(inputEl, listEl, onPick) {
+  function hide() {
+    listEl.classList.add("hidden");
+    listEl.innerHTML = "";
+  }
+  inputEl.addEventListener("input", () => {
+    const q = normalizeName(inputEl.value);
+    if (!q) { hide(); return; }
+    const matches = BRANDS.filter((b) => normalizeName(b.name).includes(q)).slice(0, MAX_SUGGESTIONS);
+    if (!matches.length) { hide(); return; }
+    listEl.innerHTML = "";
+    matches.forEach((b) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "brand-suggestion";
+      item.textContent = b.name;
+      item.addEventListener("click", () => {
+        inputEl.value = b.name;
+        hide();
+        onPick(b);
+      });
+      listEl.appendChild(item);
+    });
+    listEl.classList.remove("hidden");
+  });
+  document.addEventListener("click", (e) => {
+    if (e.target !== inputEl && !listEl.contains(e.target)) hide();
+  });
+  return { hide };
 }
 
 /* =========================================================
@@ -338,10 +552,6 @@ function moveDrag(clientY) {
   const draggedRect = row.getBoundingClientRect();
   const draggedMid = draggedRect.top + draggedRect.height / 2;
 
-  // Find the correct slot for the dragged row by comparing against every
-  // other row's midpoint (not just the immediate neighbor) — this handles
-  // both directions correctly and even lets a fast drag skip several rows
-  // at once instead of only being able to swap one step at a time.
   const rows = Array.from(els.cardList.children);
   let insertBeforeNode = null;
   for (const sib of rows) {
@@ -354,14 +564,14 @@ function moveDrag(clientY) {
     }
   }
 
-  const currentSlot = row.nextElementSibling; // null if row is currently last
+  const currentSlot = row.nextElementSibling;
   const alreadyThere =
     insertBeforeNode === currentSlot || (insertBeforeNode === null && currentSlot === null);
   if (alreadyThere) return;
 
   const prevRects = captureRowRects();
   const beforeTop = row.getBoundingClientRect().top;
-  els.cardList.insertBefore(row, insertBeforeNode); // insertBeforeNode === null appends at the end
+  els.cardList.insertBefore(row, insertBeforeNode);
   row.style.transform = "none";
   const afterTopNoTransform = row.getBoundingClientRect().top;
   const neededDy = beforeTop - afterTopNoTransform;
@@ -439,7 +649,6 @@ function attachRowDrag(row) {
     }, LONG_PRESS_MS);
   });
 
-  // Swallow the click that would otherwise fire right after a drag release.
   row.addEventListener(
     "click",
     (e) => {
@@ -481,14 +690,38 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+/* =========================================================
+   CARD DETAIL VIEW
+   ========================================================= */
 function refreshSpotHint(card) {
   const n = (card.locations || []).length;
-  if (n === 0) {
-    els.spotHint.textContent = "Zatím appka nezná žádné tvoje místo pro tuhle kartičku.";
-  } else {
-    els.spotHint.textContent =
-      "Uloženo míst: " + n + " — příště tě appka pozná i bez map, jakmile budeš blízko.";
+  els.spotHint.textContent =
+    n === 0
+      ? "Zatím appka nezná žádné tvoje místo pro tuhle kartičku."
+      : "Uloženo míst: " + n + " — příště tě appka pozná i bez map, jakmile budeš blízko.";
+}
+
+function daysAgo(ts) {
+  const days = Math.floor((Date.now() - ts) / (1000 * 60 * 60 * 24));
+  if (days <= 0) return "dnes";
+  if (days === 1) return "před 1 dnem";
+  return "před " + days + " dny";
+}
+
+function refreshBrandSyncUI(card) {
+  if (card.brandId == null) {
+    els.brandSyncRow.classList.add("hidden");
+    els.assignBrandRow.classList.remove("hidden");
+    els.assignBrandWrap.classList.add("hidden");
+    els.assignBrandInput.value = "";
+    return;
   }
+  els.assignBrandRow.classList.add("hidden");
+  els.brandSyncRow.classList.remove("hidden");
+  const meta = syncMetaCache.get(card.brandId);
+  els.brandSyncHint.textContent = meta
+    ? "Pobočky (" + meta.poiCount + ") aktualizovány " + daysAgo(meta.syncedAt) + "."
+    : "Pobočky této značky ještě nejsou stažené.";
 }
 
 function openCardView(id) {
@@ -499,6 +732,7 @@ function openCardView(id) {
   els.viewName.textContent = card.name;
   els.viewImg.src = card.image;
   refreshSpotHint(card);
+  refreshBrandSyncUI(card);
   showPanel("viewState");
 }
 
@@ -545,7 +779,45 @@ function renderForMatches(matchedCards) {
   }
 }
 
-async function evaluateLocation(lat, lon) {
+function lockMatches(matches) {
+  lockedMatchIds = matches.map((c) => c.id);
+  lockedAt = Date.now();
+  userBrowsedAway = false;
+}
+function namesOf(cards) {
+  return cards.map((c) => c.name).join(", ");
+}
+
+// Compare current position against the local brand-POI database, but only
+// for brands the user actually owns a card for — never scans everything.
+async function findBrandMatches(here, accuracy, cards) {
+  const brandCards = cards.filter((c) => c.brandId != null);
+  if (!brandCards.length) return [];
+
+  const byBrand = new Map();
+  brandCards.forEach((c) => {
+    if (!byBrand.has(c.brandId)) byBrand.set(c.brandId, []);
+    byBrand.get(c.brandId).push(c);
+  });
+
+  const margin = Math.min(accuracy || 0, ACCURACY_MARGIN_CAP_M);
+  const effectiveRadius = AUTO_MATCH_RADIUS_M + margin;
+
+  const matches = [];
+  for (const [brandId, cardsForBrand] of byBrand) {
+    const pois = await dbGetPoisForBrand(brandId);
+    if (!pois.length) continue;
+    let nearest = Infinity;
+    for (const p of pois) {
+      const d = distanceMeters(here, p);
+      if (d < nearest) nearest = d;
+    }
+    if (nearest <= effectiveRadius) matches.push(...cardsForBrand);
+  }
+  return matches;
+}
+
+async function evaluateLocation(lat, lon, accuracy) {
   if (manualViewOpen) {
     // User is actively looking at a card they picked themselves — never
     // switch it out from under them because of a background location update.
@@ -559,66 +831,67 @@ async function evaluateLocation(lat, lon) {
     return;
   }
 
-  // --- FAST PATH: compare against each card's own remembered GPS spots. ---
-  // This needs no network call, so it's instant, and it works even for shops
-  // OpenStreetMap doesn't know about at all (e.g. individual stores inside a
-  // shopping mall) — as long as you've confirmed you were there once before.
   const here = { lat, lon };
+
+  // 1) FASTEST: each card's own remembered exact spots. No network, works for
+  //    literally any card (branded or not), including shops OSM never mapped.
   const localMatches = allCards.filter((card) =>
     (card.locations || []).some((loc) => distanceMeters(here, loc) <= LOCAL_MATCH_RADIUS_M)
   );
   if (localMatches.length > 0) {
-    lockedMatchIds = localMatches.map((c) => c.id);
-    lockedAt = Date.now();
-    userBrowsedAway = false;
-    setStatus("Poblíž (podle uložené polohy): " + localMatches.map((c) => c.name).join(", "), "live");
+    lockMatches(localMatches);
+    setStatus("Poblíž (podle uložené polohy): " + namesOf(localMatches), "live");
     renderForMatches(localMatches);
     return;
   }
 
-  // --- SLOWER FALLBACK: ask OpenStreetMap what's nearby by name. ---
-  setStatus("Zjišťuji, kde právě jsi…", "warn");
+  // 2) LOCAL DATABASE: brand branches downloaded ahead of time, filtered to
+  //    just the brands you actually have cards for. Also offline, no waiting.
+  const brandMatches = await findBrandMatches(here, accuracy, allCards);
+  if (brandMatches.length > 0) {
+    lockMatches(brandMatches);
+    setStatus("Poblíž (podle databáze poboček): " + namesOf(brandMatches), "live");
+    renderForMatches(brandMatches);
+    // Learn this exact spot so next time is instant even without the DB lookup.
+    brandMatches.forEach((c) => dbAddLocationToCard(c.id, lat, lon));
+    return;
+  }
 
-  let nearby = [];
-  try {
-    nearby = await fetchNearbyPlaces(lat, lon);
-  } catch (err) {
-    // Network hiccup: if we still have a locked match, just keep it on screen
-    // instead of bouncing to the fallback list.
-    if (lockedMatchIds.length && Date.now() - lockedAt < MATCH_LOCK_MS) {
-      setStatus("Poloha se teď nepodařila ověřit, ale zůstáváš u nalezené kartičky", "warn");
+  // 3) SLOW FALLBACK: ask OpenStreetMap live — only for cards we truly have
+  //    no better data for (no brand assigned, or that brand isn't synced yet).
+  const fallbackCards = allCards.filter((c) => c.brandId == null || !brandHasPois(c.brandId));
+  if (fallbackCards.length > 0) {
+    setStatus("Zjišťuji, kde právě jsi…", "warn");
+    let nearby = [];
+    try {
+      nearby = await fetchNearbyPlaces(lat, lon);
+    } catch (err) {
+      if (lockedMatchIds.length && Date.now() - lockedAt < MATCH_LOCK_MS) {
+        setStatus("Poloha se teď nepodařila ověřit, ale zůstáváš u nalezené kartičky", "warn");
+        return;
+      }
+      setStatus("Okolí se nepodařilo zjistit — vyber kartičku ručně", "err");
+      renderCardList(allCards, "Nepodařilo se ověřit polohu");
       return;
     }
-    setStatus("Okolí se nepodařilo zjistit — vyber kartičku ručně", "err");
-    renderCardList(allCards, "Nepodařilo se ověřit polohu");
-    return;
+
+    const matched = fallbackCards.filter((card) => nearby.some((p) => namesMatch(card.name, p.name)));
+    if (matched.length > 0) {
+      lockMatches(matched);
+      setStatus("Poblíž: " + namesOf(matched), "live");
+      renderForMatches(matched);
+      matched.forEach((c) => dbAddLocationToCard(c.id, lat, lon));
+      return;
+    }
   }
 
-  const matched = [];
-  for (const card of allCards) {
-    const hit = nearby.some((p) => namesMatch(card.name, p.name));
-    if (hit) matched.push(card);
-  }
-
-  if (matched.length > 0) {
-    lockedMatchIds = matched.map((c) => c.id);
-    lockedAt = Date.now();
-    userBrowsedAway = false;
-    setStatus("Poblíž: " + matched.map((c) => c.name).join(", "), "live");
-    renderForMatches(matched);
-    // Remember this spot for next time, so future visits skip the slow OSM
-    // lookup entirely and use the instant local match instead.
-    matched.forEach((c) => dbAddLocationToCard(c.id, lat, lon));
-    return;
-  }
-
-  // No match this round — but if we recently had one locked in and the user
-  // hasn't manually browsed away, keep showing it rather than flicker to the list.
+  // Nothing matched this round — but if we recently had one locked in and the
+  // user hasn't manually browsed away, keep showing it rather than flicker.
   const stillLocked = lockedMatchIds.length && Date.now() - lockedAt < MATCH_LOCK_MS;
   if (stillLocked && !userBrowsedAway) {
     const stillCards = allCards.filter((c) => lockedMatchIds.includes(c.id));
     if (stillCards.length) {
-      setStatus("Poblíž: " + stillCards.map((c) => c.name).join(", "), "live");
+      setStatus("Poblíž: " + namesOf(stillCards), "live");
       renderForMatches(stillCards);
       return;
     }
@@ -642,10 +915,8 @@ function distanceMeters(a, b) {
   return 2 * R * Math.asin(Math.sqrt(x));
 }
 
-function maybeRecheck(lat, lon) {
+function maybeRecheck(lat, lon, accuracy) {
   if (manualViewOpen) {
-    // A card is open on screen — don't burn Overpass calls checking location
-    // in the background. We'll do a fresh check the moment the card is closed.
     return;
   }
   const now = Date.now();
@@ -655,7 +926,7 @@ function maybeRecheck(lat, lon) {
   if (moved < RECHECK_MIN_DISTANCE_M && elapsed < RECHECK_MIN_INTERVAL_MS) return;
   lastCheckedAt = now;
   lastCheckedPos = pos;
-  evaluateLocation(lat, lon);
+  evaluateLocation(lat, lon, accuracy);
 }
 
 let watchStarted = false;
@@ -673,15 +944,12 @@ function startLocating() {
 
   setStatus("Zjišťuji, kde právě jsi…", "warn");
 
-  // Force a fresh reading (bypass the debounce) whenever this is called directly,
-  // e.g. from a manual tap — important on iOS, which requires geolocation to be
-  // triggered by a direct user gesture rather than firing automatically on load.
   navigator.geolocation.getCurrentPosition(
     (p) => {
       lastCheckedAt = Date.now();
       lastCheckedPos = { lat: p.coords.latitude, lon: p.coords.longitude };
       lastKnownPosition = { lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy };
-      evaluateLocation(p.coords.latitude, p.coords.longitude);
+      evaluateLocation(p.coords.latitude, p.coords.longitude, p.coords.accuracy);
     },
     (err) => {
       let msg = "Poloha se nepodařila — vyber kartičku ručně";
@@ -697,15 +965,12 @@ function startLocating() {
     { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
   );
 
-  // Keep tracking in the background so it re-checks automatically while you walk
-  // around — this works fine once the first getCurrentPosition() above has
-  // succeeded and permission is granted.
   if (!watchStarted) {
     watchStarted = true;
     navigator.geolocation.watchPosition(
       (p) => {
         lastKnownPosition = { lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy };
-        maybeRecheck(p.coords.latitude, p.coords.longitude);
+        maybeRecheck(p.coords.latitude, p.coords.longitude, p.coords.accuracy);
       },
       () => {},
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 15000 }
@@ -718,10 +983,12 @@ function startLocating() {
    ========================================================= */
 function openAddModal() {
   els.storeName.value = "";
+  selectedBrandId = null;
   pendingImageDataUrl = null;
   els.previewImg.classList.add("hidden");
   els.dropZoneEmpty.classList.remove("hidden");
   els.btnSaveCard.disabled = true;
+  els.brandSuggestions.classList.add("hidden");
   els.addModal.classList.remove("hidden");
   setTimeout(() => els.storeName.focus(), 50);
 }
@@ -732,6 +999,11 @@ function closeAddModal() {
 function updateSaveEnabled() {
   els.btnSaveCard.disabled = !(pendingImageDataUrl && els.storeName.value.trim().length > 0);
 }
+
+wireBrandAutocomplete(els.storeName, els.brandSuggestions, (brand) => {
+  selectedBrandId = brand.id;
+  updateSaveEnabled();
+});
 
 els.dropZone.addEventListener("click", () => els.qrFile.click());
 
@@ -749,17 +1021,23 @@ els.qrFile.addEventListener("change", () => {
   reader.readAsDataURL(file);
 });
 
-els.storeName.addEventListener("input", updateSaveEnabled);
+els.storeName.addEventListener("input", () => {
+  selectedBrandId = null; // typing invalidates a previously picked suggestion
+  updateSaveEnabled();
+});
 
 els.btnSaveCard.addEventListener("click", async () => {
   const name = els.storeName.value.trim();
   if (!name || !pendingImageDataUrl) return;
-  await dbAddCard(name, pendingImageDataUrl);
+  const brandIdToSave = selectedBrandId;
+  await dbAddCard(name, pendingImageDataUrl, brandIdToSave);
   closeAddModal();
   toast("Kartička „" + name + "“ uložena");
   await refreshCards();
+  if (brandIdToSave != null) {
+    maybeSyncBrand(brandIdToSave); // background — doesn't block the UI
+  }
   if (allCards.length === 1) {
-    // first ever card — try to locate again so it can match immediately
     startLocating();
   } else {
     renderCardList(allCards, "Tvoje kartičky");
@@ -775,6 +1053,29 @@ els.btnLocate.addEventListener("click", () => {
 els.btnAdd.addEventListener("click", openAddModal);
 els.btnAddFromEmpty.addEventListener("click", openAddModal);
 els.btnCloseModal.addEventListener("click", closeAddModal);
+
+/* =========================================================
+   ASSIGN A BRAND TO AN OLD (LEGACY) CARD
+   ========================================================= */
+els.btnShowAssignBrand.addEventListener("click", () => {
+  els.assignBrandWrap.classList.toggle("hidden");
+  if (!els.assignBrandWrap.classList.contains("hidden")) {
+    els.assignBrandInput.focus();
+  }
+});
+
+wireBrandAutocomplete(els.assignBrandInput, els.assignBrandSuggestions, async (brand) => {
+  if (currentViewCardId == null) return;
+  await dbSetCardBrand(currentViewCardId, brand.id);
+  await refreshCards();
+  const card = allCards.find((c) => c.id === currentViewCardId);
+  if (card) {
+    els.viewName.textContent = card.name;
+    refreshBrandSyncUI(card);
+  }
+  toast("Značka přiřazena ✓");
+  maybeSyncBrand(brand.id);
+});
 
 /* =========================================================
    NAVIGATION BUTTONS
@@ -820,6 +1121,21 @@ els.btnClearSpots.addEventListener("click", async () => {
   const updated = allCards.find((c) => c.id === currentViewCardId);
   if (updated) refreshSpotHint(updated);
   toast("Uložená místa smazána");
+});
+
+els.btnSyncBrand.addEventListener("click", async () => {
+  if (currentViewCardId == null) return;
+  const card = allCards.find((c) => c.id === currentViewCardId);
+  if (!card || card.brandId == null) return;
+  toast("Stahuji pobočky…");
+  try {
+    const n = await syncBrandPois(card.brandId);
+    await loadSyncMetaCache();
+    refreshBrandSyncUI(card);
+    toast("Pobočky aktualizovány (" + n + ")");
+  } catch (e) {
+    toast("Nepodařilo se stáhnout pobočky — zkus to později");
+  }
 });
 
 els.btnDeleteFromView.addEventListener("click", async () => {
@@ -908,6 +1224,7 @@ if ("serviceWorker" in navigator) {
    BOOT
    ========================================================= */
 (async function boot() {
+  await loadSyncMetaCache();
   await refreshCards();
   if (allCards.length === 0) {
     renderForNoCards();
@@ -915,9 +1232,6 @@ if ("serviceWorker" in navigator) {
   } else {
     setStatus("Klepni na 📍 Najít a zjisti, kde jsi", null);
   }
-  // Try automatically too — works fine on Android/desktop. On iOS this first
-  // automatic attempt may be silently ignored, so the 📍 Najít button is the
-  // reliable fallback there.
   startLocating();
   maybeShowIosBanner();
 })();

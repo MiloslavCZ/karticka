@@ -81,6 +81,20 @@
       </div>
       <button class="btn-primary btn-small" id="btnSaveSpot">📍 Uložit, že jsem tady</button>
       <p class="spot-hint" id="spotHint"></p>
+
+      <div id="brandSyncRow" class="brand-sync-row hidden">
+        <p class="brand-sync-hint" id="brandSyncHint"></p>
+        <button class="btn-ghost" id="btnSyncBrand">🔄 Aktualizovat pobočky</button>
+      </div>
+
+      <div id="assignBrandRow" class="assign-brand-row hidden">
+        <button class="btn-ghost" id="btnShowAssignBrand">Přiřadit značku (rychlejší rozpoznání)</button>
+        <div id="assignBrandWrap" class="autocomplete-wrap hidden">
+          <input id="assignBrandInput" class="text-input" type="text" placeholder="Např. Kaufland, Albert…" autocomplete="off">
+          <div id="assignBrandSuggestions" class="brand-suggestions hidden"></div>
+        </div>
+      </div>
+
       <div class="view-footer">
         <button class="btn-ghost" id="btnClearSpots">Vymazat uložená místa</button>
         <button class="btn-danger-ghost" id="btnDeleteFromView">Smazat tuto kartičku</button>
@@ -111,9 +125,12 @@
       <button id="btnCloseModal" class="btn-icon" aria-label="Zavřít">✕</button>
     </div>
 
-    <label class="field-label" for="storeName">Název obchodu</label>
-    <input id="storeName" class="text-input" type="text" placeholder="např. Albert, Kaufland, OMV…" autocomplete="off">
-    <p class="hint">Zkus přesně to jméno, jak ho appka najde na mapě (Albert, Lidl, Billa, OMV, Orlen…). Pomůže to automatickému rozpoznání.</p>
+    <label class="field-label" for="storeName">Obchod / řetězec</label>
+    <div class="autocomplete-wrap">
+      <input id="storeName" class="text-input" type="text" placeholder="Např. Kaufland, Albert, OMV…" autocomplete="off">
+      <div id="brandSuggestions" class="brand-suggestions hidden"></div>
+    </div>
+    <p class="hint">Vyber značku ze seznamu — appka pak umí sama najít všechny její pobočky. Pokud tvůj obchod v seznamu není, klidně napiš vlastní název; appka ho zkusí najít podle mapy poblíž.</p>
 
     <label class="field-label" for="qrFile">Fotka / screenshot QR kódu</label>
     <div id="dropZone" class="drop-zone">
@@ -147,6 +164,7 @@
 
 <div id="toast" class="toast hidden"></div>
 
+<script src="brands.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
