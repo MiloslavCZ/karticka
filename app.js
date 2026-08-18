@@ -388,6 +388,13 @@ const els = {
   dropZoneEmpty: el("dropZoneEmpty"),
   previewImg: el("previewImg"),
   qrFile: el("qrFile"),
+  cropStage: el("cropStage"),
+  cropFrame: el("cropFrame"),
+  cropSourceImg: el("cropSourceImg"),
+  cropBox: el("cropBox"),
+  btnCropCancel: el("btnCropCancel"),
+  btnCropAuto: el("btnCropAuto"),
+  btnCropConfirm: el("btnCropConfirm"),
   btnSaveCard: el("btnSaveCard"),
   installBanner: el("installBanner"),
   installTitle: el("installTitle"),
@@ -987,6 +994,8 @@ function openAddModal() {
   pendingImageDataUrl = null;
   els.previewImg.classList.add("hidden");
   els.dropZoneEmpty.classList.remove("hidden");
+  els.cropStage.classList.add("hidden");
+  els.dropZone.classList.remove("hidden");
   els.btnSaveCard.disabled = true;
   els.brandSuggestions.classList.add("hidden");
   els.addModal.classList.remove("hidden");
@@ -1011,14 +1020,228 @@ els.qrFile.addEventListener("change", () => {
   const file = els.qrFile.files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = () => {
-    pendingImageDataUrl = reader.result;
-    els.previewImg.src = pendingImageDataUrl;
-    els.previewImg.classList.remove("hidden");
-    els.dropZoneEmpty.classList.add("hidden");
-    updateSaveEnabled();
-  };
+  reader.onload = () => openCropStage(reader.result);
   reader.readAsDataURL(file);
+});
+
+/* =========================================================
+   QR PHOTO CROP TOOL
+   Lets the person trim a full screenshot down to just the QR
+   code itself, so the saved card matches the app's own design
+   instead of showing the surrounding app chrome / phone frame.
+   ========================================================= */
+let cropNaturalW = 0;
+let cropNaturalH = 0;
+let cropBoxState = { x: 0, y: 0, size: 0 }; // in rendered px, relative to cropFrame
+
+function clampNum(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+function frameRect() {
+  return els.cropFrame.getBoundingClientRect();
+}
+function renderCropBox() {
+  els.cropBox.style.left = cropBoxState.x + "px";
+  els.cropBox.style.top = cropBoxState.y + "px";
+  els.cropBox.style.width = cropBoxState.size + "px";
+  els.cropBox.style.height = cropBoxState.size + "px";
+}
+
+function openCropStage(dataUrl) {
+  els.cropSourceImg.onload = () => {
+    cropNaturalW = els.cropSourceImg.naturalWidth;
+    cropNaturalH = els.cropSourceImg.naturalHeight;
+    els.dropZone.classList.add("hidden");
+    els.cropStage.classList.remove("hidden");
+    requestAnimationFrame(() => {
+      const rect = frameRect();
+      const size = Math.min(rect.width, rect.height) * 0.7;
+      cropBoxState = { x: (rect.width - size) / 2, y: (rect.height - size) / 2, size };
+      renderCropBox();
+      suggestCropAuto();
+    });
+  };
+  els.cropSourceImg.src = dataUrl;
+}
+
+function closeCropStage() {
+  els.cropStage.classList.add("hidden");
+  els.dropZone.classList.remove("hidden");
+}
+
+// Best-effort auto-placement: QR modules are areas of very high local
+// contrast (sharp black/white edges), which usually stands out clearly from
+// smoother UI chrome or photos around it. This is a heuristic, not real QR
+// detection — the person can always drag the box to fine-tune it.
+function suggestCropAuto() {
+  try {
+    const GRID = 32;
+    const off = document.createElement("canvas");
+    off.width = GRID;
+    off.height = GRID;
+    const octx = off.getContext("2d");
+    octx.drawImage(els.cropSourceImg, 0, 0, GRID, GRID);
+    const data = octx.getImageData(0, 0, GRID, GRID).data;
+
+    const gray = new Float32Array(GRID * GRID);
+    for (let i = 0; i < GRID * GRID; i++) {
+      gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+    }
+    const score = new Float32Array(GRID * GRID);
+    for (let y = 1; y < GRID - 1; y++) {
+      for (let x = 1; x < GRID - 1; x++) {
+        const idx = y * GRID + x;
+        const c = gray[idx];
+        score[idx] =
+          Math.abs(c - gray[idx - GRID]) +
+          Math.abs(c - gray[idx + GRID]) +
+          Math.abs(c - gray[idx - 1]) +
+          Math.abs(c - gray[idx + 1]);
+      }
+    }
+
+    let best = null;
+    const sizes = [0.35, 0.45, 0.55, 0.65].map((f) => Math.floor(GRID * f));
+    for (const size of sizes) {
+      for (let y = 0; y <= GRID - size; y += 2) {
+        for (let x = 0; x <= GRID - size; x += 2) {
+          let sum = 0;
+          for (let yy = y; yy < y + size; yy++) {
+            for (let xx = x; xx < x + size; xx++) {
+              sum += score[yy * GRID + xx];
+            }
+          }
+          const avg = sum / (size * size);
+          if (!best || avg > best.avg) best = { avg, x, y, size };
+        }
+      }
+    }
+    if (!best) return;
+
+    // Add a margin around the detected high-contrast core so the QR code's
+    // required "quiet zone" (blank border) stays intact for reliable scanning.
+    const padded = Math.min(best.size * 1.25, GRID);
+    const cx = best.x + best.size / 2;
+    const cy = best.y + best.size / 2;
+    const gx = clampNum(cx - padded / 2, 0, GRID - padded);
+    const gy = clampNum(cy - padded / 2, 0, GRID - padded);
+
+    const rect = frameRect();
+    const cellToPxX = rect.width / GRID;
+    const cellToPxY = rect.height / GRID;
+    const boxSize = Math.min(padded * cellToPxX, padded * cellToPxY);
+    cropBoxState = {
+      x: clampNum(gx * cellToPxX, 0, rect.width - boxSize),
+      y: clampNum(gy * cellToPxY, 0, rect.height - boxSize),
+      size: boxSize
+    };
+    renderCropBox();
+  } catch (e) {
+    // Heuristic is best-effort only — leave the default centered box in place.
+  }
+}
+
+// Drag to move the whole box.
+els.cropBox.addEventListener("pointerdown", (e) => {
+  if (e.target.classList.contains("crop-handle")) return;
+  e.preventDefault();
+  const startBox = { ...cropBoxState };
+  const startX = e.clientX;
+  const startY = e.clientY;
+  function onMove(ev) {
+    const rect = frameRect();
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    cropBoxState.x = clampNum(startBox.x + dx, 0, rect.width - startBox.size);
+    cropBoxState.y = clampNum(startBox.y + dy, 0, rect.height - startBox.size);
+    renderCropBox();
+  }
+  function onUp() {
+    document.removeEventListener("pointermove", onMove);
+    document.removeEventListener("pointerup", onUp);
+  }
+  document.addEventListener("pointermove", onMove, { passive: false });
+  document.addEventListener("pointerup", onUp);
+});
+
+// Drag a corner handle to resize (kept square).
+els.cropStage.querySelectorAll(".crop-handle").forEach((handle) => {
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const corner = handle.dataset.corner;
+    const startBox = { ...cropBoxState };
+    const startX = e.clientX;
+    const startY = e.clientY;
+    function onMove(ev) {
+      const rect = frameRect();
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      let delta;
+      if (corner === "br") delta = Math.max(dx, dy);
+      else if (corner === "tl") delta = Math.max(-dx, -dy);
+      else if (corner === "tr") delta = Math.max(dx, -dy);
+      else delta = Math.max(-dx, dy); // bl
+
+      let newSize = clampNum(startBox.size + delta, 40, Math.min(rect.width, rect.height));
+      let newX = startBox.x;
+      let newY = startBox.y;
+      if (corner === "tl") {
+        newX = startBox.x + (startBox.size - newSize);
+        newY = startBox.y + (startBox.size - newSize);
+      } else if (corner === "tr") {
+        newY = startBox.y + (startBox.size - newSize);
+      } else if (corner === "bl") {
+        newX = startBox.x + (startBox.size - newSize);
+      }
+      newX = clampNum(newX, 0, rect.width - newSize);
+      newY = clampNum(newY, 0, rect.height - newSize);
+      newSize = Math.min(newSize, rect.width - newX, rect.height - newY);
+
+      cropBoxState = { x: newX, y: newY, size: newSize };
+      renderCropBox();
+    }
+    function onUp() {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    }
+    document.addEventListener("pointermove", onMove, { passive: false });
+    document.addEventListener("pointerup", onUp);
+  });
+});
+
+els.btnCropAuto.addEventListener("click", suggestCropAuto);
+
+els.btnCropCancel.addEventListener("click", () => {
+  closeCropStage();
+  els.qrFile.value = "";
+  els.qrFile.click();
+});
+
+els.btnCropConfirm.addEventListener("click", () => {
+  const rect = frameRect();
+  const scaleX = cropNaturalW / rect.width;
+  const scaleY = cropNaturalH / rect.height;
+  const sx = cropBoxState.x * scaleX;
+  const sy = cropBoxState.y * scaleY;
+  const sw = cropBoxState.size * scaleX;
+  const sh = cropBoxState.size * scaleY;
+
+  const OUT = 640;
+  const canvas = document.createElement("canvas");
+  canvas.width = OUT;
+  canvas.height = OUT;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, OUT, OUT);
+  ctx.drawImage(els.cropSourceImg, sx, sy, sw, sh, 0, 0, OUT, OUT);
+
+  pendingImageDataUrl = canvas.toDataURL("image/png");
+  els.previewImg.src = pendingImageDataUrl;
+  els.previewImg.classList.remove("hidden");
+  els.dropZoneEmpty.classList.add("hidden");
+  closeCropStage();
+  updateSaveEnabled();
 });
 
 els.storeName.addEventListener("input", () => {
