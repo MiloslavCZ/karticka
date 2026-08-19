@@ -141,26 +141,7 @@
       </div>
     </div>
     <input id="qrFile" type="file" accept="image/*" class="visually-hidden">
-
-    <div id="cropStage" class="crop-stage hidden">
-      <div class="crop-viewport" id="cropViewport">
-        <div class="crop-frame" id="cropFrame">
-          <img id="cropSourceImg" class="crop-source-img" alt="">
-          <div id="cropBox" class="crop-box">
-            <span class="crop-handle" data-corner="tl"></span>
-            <span class="crop-handle" data-corner="tr"></span>
-            <span class="crop-handle" data-corner="bl"></span>
-            <span class="crop-handle" data-corner="br"></span>
-          </div>
-        </div>
-      </div>
-      <p class="hint">Přetáhni rámeček přesně na QR kód (nech kolem něj tenký bílý okraj, ať jde spolehlivě naskenovat).</p>
-      <div class="crop-actions">
-        <button type="button" class="btn-ghost" id="btnCropCancel">Jiná fotka</button>
-        <button type="button" class="btn-ghost" id="btnCropAuto">✨ Navrhnout znovu</button>
-        <button type="button" class="btn-primary" id="btnCropConfirm">Použít výřez</button>
-      </div>
-    </div>
+    <p class="hint" id="qrReadHint"></p>
 
     <button id="btnSaveCard" class="btn-primary btn-full" disabled>Uložit kartičku</button>
   </div>
@@ -184,6 +165,8 @@
 
 <div id="toast" class="toast hidden"></div>
 
+<script src="vendor/jsQR.js"></script>
+<script src="vendor/qrcode-generator.js"></script>
 <script src="brands.js"></script>
 <script src="app.js"></script>
 </body>
